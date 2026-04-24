@@ -1,13 +1,19 @@
 -- ============================================================
--- PATEROS ZERO HUNGER MANAGEMENT SYSTEM (PHMS)
--- Revised Database Schema v2 — MySQL 9.6.0
+-- PATEROS ZERO HUNGER MANAGEMENT SYSTEM (PHAMS)
+-- Database Schema v3 — MySQL 9.6.0
+-- Advanced Database Systems | AY 2025-2026
 -- ============================================================
--- FIXES IN v2:
---   - sp_compute_priority_score: moved all DECLAREs to top of
---     BEGIN block (MySQL requires this — no DECLARE inside IF)
---   - sp_record_distribution: changed LEAVE label from
---     'sp_record_distribution' to 'proc_main' to match the
---     labeled BEGIN block (MySQL requires explicit label)
+-- CHANGELOG:
+-- v1 — Original schema (teammate's draft, MariaDB)
+-- v2 — Full redesign: ledger model, users, audit_log, triggers,
+--       stored procedures, views, indexes. Fixed DECLARE placement
+--       and LEAVE label issues.
+-- v3 — Fixed trg_family_after_insert: removed UPDATE families
+--       from inside a trigger fired by families INSERT
+--       (MySQL ER_CANT_UPDATE_USED_TABLE_IN_SF_OR_TRG).
+--       Priority score on insert now starts at 0.00 (default)
+--       and is computed by trg_member_after_insert once the
+--       first family member is added. Audit log only in this trigger.
 -- ============================================================
 
 SET SQL_MODE = "NO_AUTO_VALUE_ON_ZERO";
@@ -17,6 +23,7 @@ SET time_zone = "+00:00";
 
 -- ============================================================
 -- TABLE 1: barangays
+-- The 10 official barangays of Pateros. Static reference data.
 -- ============================================================
 CREATE TABLE barangays (
     barangay_id     INT             NOT NULL AUTO_INCREMENT,
@@ -38,13 +45,16 @@ INSERT INTO barangays (name) VALUES
 
 -- ============================================================
 -- TABLE 2: users
+-- System accounts. Admin: barangay_id = NULL (all access).
+-- Staff: barangay_id = assigned barangay only.
+-- Passwords stored as bcrypt hashes — never plain text.
 -- ============================================================
 CREATE TABLE users (
     user_id         INT             NOT NULL AUTO_INCREMENT,
     full_name       VARCHAR(150)    NOT NULL,
     email           VARCHAR(150)    NOT NULL,
     password_hash   VARCHAR(255)    NOT NULL,
-    role            ENUM('Admin', 'Staff') NOT NULL DEFAULT 'Staff',
+    role            ENUM('Admin','Staff') NOT NULL DEFAULT 'Staff',
     barangay_id     INT             NULL,
     is_active       TINYINT(1)      NOT NULL DEFAULT 1,
     created_at      DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -58,6 +68,15 @@ CREATE TABLE users (
 
 -- ============================================================
 -- TABLE 3: families
+-- Core beneficiary table. Covers regular households AND
+-- individuals without permanent addresses (is_npa = 1).
+--
+-- priority_score (0-100): computed by sp_compute_priority_score,
+-- called from trg_member_after_insert and trg_member_after_update.
+-- Starts at 0.00 on family insert; updated after first member added.
+--
+-- Vulnerability flags: denormalized for fast priority queries.
+-- Updated automatically by triggers on family_members changes.
 -- ============================================================
 CREATE TABLE families (
     family_id               INT             NOT NULL AUTO_INCREMENT,
@@ -100,6 +119,9 @@ CREATE TABLE families (
 
 -- ============================================================
 -- TABLE 4: family_members
+-- Individual members per household.
+-- date_of_birth stored instead of age (age changes yearly).
+-- NPA families require at least one member record.
 -- ============================================================
 CREATE TABLE family_members (
     member_id           INT             NOT NULL AUTO_INCREMENT,
@@ -124,6 +146,8 @@ CREATE TABLE family_members (
 
 -- ============================================================
 -- TABLE 5: food_supplies
+-- Catalog of food types. Does NOT store quantity.
+-- Current stock is always derived from inventory_transactions.
 -- ============================================================
 CREATE TABLE food_supplies (
     food_id             INT             NOT NULL AUTO_INCREMENT,
@@ -154,6 +178,7 @@ CREATE TABLE donors (
 
 -- ============================================================
 -- TABLE 7: donations
+-- One record per donation event. Line items in donation_items.
 -- ============================================================
 CREATE TABLE donations (
     donation_id     INT             NOT NULL AUTO_INCREMENT,
@@ -175,6 +200,9 @@ CREATE TABLE donations (
 
 -- ============================================================
 -- TABLE 8: donation_items
+-- One row per food type per donation.
+-- Inserting here auto-creates an inventory IN transaction
+-- via trg_donation_item_after_insert.
 -- ============================================================
 CREATE TABLE donation_items (
     item_id         INT             NOT NULL AUTO_INCREMENT,
@@ -192,12 +220,20 @@ CREATE TABLE donation_items (
     CONSTRAINT fk_ditems_food
         FOREIGN KEY (food_id) REFERENCES food_supplies (food_id)
         ON UPDATE CASCADE ON DELETE RESTRICT,
-    CONSTRAINT chk_donation_quantity
-        CHECK (quantity > 0)
+    CONSTRAINT chk_donation_quantity CHECK (quantity > 0)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ============================================================
 -- TABLE 9: inventory_transactions
+-- THE LEDGER. Every food movement is a row here.
+-- Current stock = SUM(IN + ADJUST) - SUM(OUT + EXPIRED).
+-- Never update a quantity directly — always insert a new row.
+--
+-- transaction_type:
+--   IN      = received from donation
+--   OUT     = distributed to a family
+--   ADJUST  = manual correction (requires reason)
+--   EXPIRED = batch written off (requires reason)
 -- ============================================================
 CREATE TABLE inventory_transactions (
     txn_id              INT             NOT NULL AUTO_INCREMENT,
@@ -223,12 +259,13 @@ CREATE TABLE inventory_transactions (
     CONSTRAINT fk_txn_recorded_by
         FOREIGN KEY (recorded_by) REFERENCES users (user_id)
         ON UPDATE CASCADE ON DELETE RESTRICT,
-    CONSTRAINT chk_txn_quantity
-        CHECK (quantity > 0)
+    CONSTRAINT chk_txn_quantity CHECK (quantity > 0)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ============================================================
 -- TABLE 10: distributions
+-- One record per distribution event. Line items in distribution_items.
+-- priority_score_at_time: snapshot of family score at time of distribution.
 -- ============================================================
 CREATE TABLE distributions (
     distribution_id         INT             NOT NULL AUTO_INCREMENT,
@@ -277,12 +314,13 @@ CREATE TABLE distribution_items (
     CONSTRAINT fk_ditems_dist_food
         FOREIGN KEY (food_id) REFERENCES food_supplies (food_id)
         ON UPDATE CASCADE ON DELETE RESTRICT,
-    CONSTRAINT chk_dist_item_quantity
-        CHECK (quantity > 0)
+    CONSTRAINT chk_dist_item_quantity CHECK (quantity > 0)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ============================================================
 -- TABLE 12: low_stock_alerts
+-- Auto-populated by trg_check_low_stock when stock drops
+-- below food_supplies.low_stock_threshold.
 -- ============================================================
 CREATE TABLE low_stock_alerts (
     alert_id        INT             NOT NULL AUTO_INCREMENT,
@@ -303,16 +341,18 @@ CREATE TABLE low_stock_alerts (
 
 -- ============================================================
 -- TABLE 13: audit_log
+-- Immutable. Populated by triggers only — never write manually.
+-- Stores JSON snapshots of old/new values for each change.
 -- ============================================================
 CREATE TABLE audit_log (
-    log_id          BIGINT          NOT NULL AUTO_INCREMENT,
-    table_name      VARCHAR(100)    NOT NULL,
-    record_id       INT             NOT NULL,
-    action          ENUM('INSERT','UPDATE','DELETE','DEACTIVATE') NOT NULL,
-    old_values      JSON            NULL,
-    new_values      JSON            NULL,
-    changed_by      INT             NULL,
-    changed_at      DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    log_id      BIGINT          NOT NULL AUTO_INCREMENT,
+    table_name  VARCHAR(100)    NOT NULL,
+    record_id   INT             NOT NULL,
+    action      ENUM('INSERT','UPDATE','DELETE','DEACTIVATE') NOT NULL,
+    old_values  JSON            NULL,
+    new_values  JSON            NULL,
+    changed_by  INT             NULL,
+    changed_at  DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (log_id),
     INDEX idx_audit_table (table_name, record_id),
     INDEX idx_audit_user (changed_by),
@@ -323,6 +363,9 @@ CREATE TABLE audit_log (
 -- VIEWS
 -- ============================================================
 
+-- v_current_stock
+-- Derives real-time stock from the ledger.
+-- Always query this view instead of inventory_transactions directly.
 CREATE OR REPLACE VIEW v_current_stock AS
 SELECT
     fs.food_id,
@@ -354,13 +397,16 @@ LEFT JOIN inventory_transactions it ON fs.food_id = it.food_id
 WHERE fs.is_active = 1
 GROUP BY fs.food_id, fs.food_name, fs.category, fs.unit, fs.low_stock_threshold;
 
+-- v_family_priority_list
+-- Active families ordered by priority score descending.
+-- Used by distribution screens to determine who gets served next.
 CREATE OR REPLACE VIEW v_family_priority_list AS
 SELECT
     f.family_id,
     f.family_name,
     f.address,
     f.is_npa,
-    b.name                          AS barangay_name,
+    b.name                      AS barangay_name,
     f.monthly_income,
     f.food_assistance_status,
     f.member_count,
@@ -369,7 +415,7 @@ SELECT
     f.has_pwd_member,
     f.has_malnourished_member,
     f.priority_score,
-    MAX(d.distribution_date)        AS last_distribution_date,
+    MAX(d.distribution_date)    AS last_distribution_date,
     DATEDIFF(CURDATE(), MAX(d.distribution_date)) AS days_since_last_distribution
 FROM families f
 INNER JOIN barangays b ON f.barangay_id = b.barangay_id
@@ -382,17 +428,20 @@ GROUP BY
     f.has_pwd_member, f.has_malnourished_member, f.priority_score
 ORDER BY f.priority_score DESC;
 
+-- v_public_transparency_summary
+-- Aggregated, non-personal data for the public-facing website.
+-- Never expose raw families data publicly — use this view only.
 CREATE OR REPLACE VIEW v_public_transparency_summary AS
 SELECT
-    b.name                                      AS barangay_name,
-    COUNT(DISTINCT f.family_id)                 AS total_families,
-    SUM(f.member_count)                         AS total_individuals,
+    b.name                          AS barangay_name,
+    COUNT(DISTINCT f.family_id)     AS total_families,
+    SUM(f.member_count)             AS total_individuals,
     COUNT(DISTINCT CASE
         WHEN d.distribution_id IS NOT NULL THEN f.family_id
-    END)                                        AS families_assisted,
-    COUNT(DISTINCT d.distribution_id)           AS total_distributions
+    END)                            AS families_assisted,
+    COUNT(DISTINCT d.distribution_id) AS total_distributions
 FROM barangays b
-LEFT JOIN families f     ON b.barangay_id = f.barangay_id AND f.is_active = 1
+LEFT JOIN families f      ON b.barangay_id = f.barangay_id AND f.is_active = 1
 LEFT JOIN distributions d ON f.family_id = d.family_id AND d.status = 'Received'
 GROUP BY b.barangay_id, b.name;
 
@@ -402,34 +451,39 @@ GROUP BY b.barangay_id, b.name;
 
 DELIMITER $$
 
--- ─────────────────────────────────────────────────────────────
--- PROCEDURE: sp_compute_priority_score
--- FIX: All DECLARE statements moved to top of BEGIN block.
---      MySQL requires all DECLAREs before any other statements.
--- ─────────────────────────────────────────────────────────────
+-- sp_compute_priority_score
+-- Computes 0-100 priority score for one family.
+-- Called by trg_member_after_insert and trg_member_after_update.
+-- NOT called from trg_family_after_insert (would cause
+-- ER_CANT_UPDATE_USED_TABLE_IN_SF_OR_TRG — see v3 changelog).
+--
+-- Scoring weights:
+--   35% income below NCR poverty line (PHP 12,082/mo, PSA 2023)
+--   30% malnourished/underweight members
+--   20% vulnerable members (child<5, senior 60+, PWD)
+--   10% per-capita dependency burden
+--    5% days since last distribution
 CREATE PROCEDURE sp_compute_priority_score(IN p_family_id INT)
 BEGIN
-    -- ALL declares must come first — no exceptions in MySQL
-    DECLARE v_income                DECIMAL(10,2)   DEFAULT NULL;
-    DECLARE v_income_score          DECIMAL(5,2)    DEFAULT 0;
-    DECLARE v_malnutrition_score    DECIMAL(5,2)    DEFAULT 0;
-    DECLARE v_vulnerability_score   DECIMAL(5,2)    DEFAULT 0;
-    DECLARE v_dependency_score      DECIMAL(5,2)    DEFAULT 0;
-    DECLARE v_recency_score         DECIMAL(5,2)    DEFAULT 0;
-    DECLARE v_total_score           DECIMAL(5,2)    DEFAULT 0;
-    DECLARE v_member_count          INT             DEFAULT 0;
-    DECLARE v_malnourished          INT             DEFAULT 0;
-    DECLARE v_has_vulnerable        INT             DEFAULT 0;
-    DECLARE v_days_since            INT             DEFAULT 999;
-    DECLARE v_per_capita            DECIMAL(10,2)   DEFAULT 0;
-    DECLARE NCR_POVERTY_LINE        DECIMAL(10,2)   DEFAULT 12082.00;
+    DECLARE v_income              DECIMAL(10,2) DEFAULT NULL;
+    DECLARE v_income_score        DECIMAL(5,2)  DEFAULT 0;
+    DECLARE v_malnutrition_score  DECIMAL(5,2)  DEFAULT 0;
+    DECLARE v_vulnerability_score DECIMAL(5,2)  DEFAULT 0;
+    DECLARE v_dependency_score    DECIMAL(5,2)  DEFAULT 0;
+    DECLARE v_recency_score       DECIMAL(5,2)  DEFAULT 0;
+    DECLARE v_total_score         DECIMAL(5,2)  DEFAULT 0;
+    DECLARE v_member_count        INT           DEFAULT 0;
+    DECLARE v_malnourished        INT           DEFAULT 0;
+    DECLARE v_has_vulnerable      INT           DEFAULT 0;
+    DECLARE v_days_since          INT           DEFAULT 999;
+    DECLARE v_per_capita          DECIMAL(10,2) DEFAULT 0;
+    DECLARE NCR_POVERTY_LINE      DECIMAL(10,2) DEFAULT 12082.00;
 
-    -- Get family income and member count
     SELECT monthly_income, member_count
     INTO v_income, v_member_count
     FROM families WHERE family_id = p_family_id;
 
-    -- Component 1: Income score (35 points max)
+    -- Component 1: Income (35 pts)
     IF v_income IS NULL THEN
         SET v_income_score = 17.5;
     ELSEIF v_income = 0 THEN
@@ -440,31 +494,31 @@ BEGIN
         SET v_income_score = 0;
     END IF;
 
-    -- Component 2: Malnutrition score (30 points max)
+    -- Component 2: Malnutrition (30 pts)
     SELECT COUNT(*) INTO v_malnourished
     FROM family_members
     WHERE family_id = p_family_id
-      AND nutritional_status IN ('Underweight', 'Severely Underweight');
+      AND nutritional_status IN ('Underweight','Severely Underweight');
 
     IF v_member_count > 0 AND v_malnourished > 0 THEN
         SET v_malnutrition_score = LEAST(30, (v_malnourished / v_member_count) * 30);
     END IF;
 
-    -- Component 3: Vulnerable members score (20 points max)
+    -- Component 3: Vulnerable members (20 pts)
     SELECT COUNT(*) INTO v_has_vulnerable
-    FROM family_members fm
-    WHERE fm.family_id = p_family_id
+    FROM family_members
+    WHERE family_id = p_family_id
       AND (
-          fm.is_pwd = 1
-          OR (fm.date_of_birth IS NOT NULL AND TIMESTAMPDIFF(YEAR, fm.date_of_birth, CURDATE()) < 5)
-          OR (fm.date_of_birth IS NOT NULL AND TIMESTAMPDIFF(YEAR, fm.date_of_birth, CURDATE()) >= 60)
+          is_pwd = 1
+          OR (date_of_birth IS NOT NULL AND TIMESTAMPDIFF(YEAR, date_of_birth, CURDATE()) < 5)
+          OR (date_of_birth IS NOT NULL AND TIMESTAMPDIFF(YEAR, date_of_birth, CURDATE()) >= 60)
       );
 
     IF v_has_vulnerable > 0 THEN
         SET v_vulnerability_score = LEAST(20, v_has_vulnerable * 5);
     END IF;
 
-    -- Component 4: Dependency burden score (10 points max)
+    -- Component 4: Dependency burden (10 pts)
     IF v_income IS NOT NULL AND v_member_count > 0 AND v_income > 0 THEN
         SET v_per_capita = v_income / v_member_count;
         IF v_per_capita < (NCR_POVERTY_LINE / 4) THEN
@@ -474,7 +528,7 @@ BEGIN
         END IF;
     END IF;
 
-    -- Component 5: Days since last distribution (5 points max)
+    -- Component 5: Recency (5 pts)
     SELECT COALESCE(DATEDIFF(CURDATE(), MAX(distribution_date)), 999)
     INTO v_days_since
     FROM distributions
@@ -488,11 +542,10 @@ BEGIN
         SET v_recency_score = 1;
     END IF;
 
-    -- Final score
-    SET v_total_score = v_income_score + v_malnutrition_score
-                      + v_vulnerability_score + v_dependency_score
-                      + v_recency_score;
-    SET v_total_score = LEAST(100, GREATEST(0, v_total_score));
+    SET v_total_score = LEAST(100, GREATEST(0,
+        v_income_score + v_malnutrition_score +
+        v_vulnerability_score + v_dependency_score + v_recency_score
+    ));
 
     UPDATE families SET
         priority_score          = v_total_score,
@@ -501,12 +554,11 @@ BEGIN
     WHERE family_id = p_family_id;
 END$$
 
--- ─────────────────────────────────────────────────────────────
--- PROCEDURE: sp_record_distribution
--- FIX: Added 'proc_main:' label to the BEGIN block so that
---      LEAVE proc_main works correctly for early exit.
---      MySQL LEAVE requires a matching labeled block.
--- ─────────────────────────────────────────────────────────────
+-- sp_record_distribution
+-- Records a complete distribution atomically (ACID).
+-- Validates stock, creates distribution header + line items +
+-- inventory OUT transactions in one transaction.
+-- If any step fails, everything rolls back.
 CREATE PROCEDURE sp_record_distribution(
     IN  p_family_id         INT,
     IN  p_distribution_type VARCHAR(50),
@@ -520,14 +572,13 @@ CREATE PROCEDURE sp_record_distribution(
     OUT p_message           VARCHAR(255)
 )
 proc_main: BEGIN
-    -- All declares at top
-    DECLARE v_barangay_id       INT;
-    DECLARE v_priority_score    DECIMAL(5,2);
-    DECLARE v_food_id           INT;
-    DECLARE v_quantity          DECIMAL(10,2);
-    DECLARE v_stock             DECIMAL(10,2);
-    DECLARE v_item_count        INT;
-    DECLARE v_i                 INT DEFAULT 0;
+    DECLARE v_barangay_id    INT;
+    DECLARE v_priority_score DECIMAL(5,2);
+    DECLARE v_food_id        INT;
+    DECLARE v_quantity       DECIMAL(10,2);
+    DECLARE v_stock          DECIMAL(10,2);
+    DECLARE v_item_count     INT;
+    DECLARE v_i              INT DEFAULT 0;
 
     DECLARE EXIT HANDLER FOR SQLEXCEPTION
     BEGIN
@@ -567,8 +618,8 @@ proc_main: BEGIN
         SET v_item_count = JSON_LENGTH(p_food_ids);
 
         WHILE v_i < v_item_count DO
-            SET v_food_id = JSON_EXTRACT(p_food_ids,  CONCAT('$[', v_i, ']'));
-            SET v_quantity = JSON_EXTRACT(p_quantities, CONCAT('$[', v_i, ']'));
+            SET v_food_id  = JSON_EXTRACT(p_food_ids,   CONCAT('$[', v_i, ']'));
+            SET v_quantity = JSON_EXTRACT(p_quantities,  CONCAT('$[', v_i, ']'));
 
             SELECT current_stock INTO v_stock
             FROM v_current_stock WHERE food_id = v_food_id;
@@ -599,9 +650,9 @@ proc_main: BEGIN
     CALL sp_compute_priority_score(p_family_id);
 END$$
 
--- ─────────────────────────────────────────────────────────────
--- FUNCTION: fn_get_current_stock
--- ─────────────────────────────────────────────────────────────
+-- fn_get_current_stock
+-- Returns current stock for a single food item.
+-- Used in triggers for quick stock checks.
 CREATE FUNCTION fn_get_current_stock(p_food_id INT)
 RETURNS DECIMAL(10,2)
 DETERMINISTIC
@@ -610,8 +661,8 @@ BEGIN
     DECLARE v_stock DECIMAL(10,2) DEFAULT 0;
     SELECT COALESCE(SUM(
         CASE
-            WHEN transaction_type IN ('IN', 'ADJUST') THEN  quantity
-            ELSE                                           -quantity
+            WHEN transaction_type IN ('IN','ADJUST') THEN  quantity
+            ELSE                                          -quantity
         END
     ), 0) INTO v_stock
     FROM inventory_transactions
@@ -627,6 +678,13 @@ DELIMITER ;
 
 DELIMITER $$
 
+-- trg_family_after_insert
+-- Writes audit log entry when a family is registered.
+-- Does NOT compute priority score here — that would cause
+-- ER_CANT_UPDATE_USED_TABLE_IN_SF_OR_TRG (MySQL limitation:
+-- cannot UPDATE families inside a trigger fired by families INSERT).
+-- Priority score starts at 0.00 and is computed by
+-- trg_member_after_insert once the first member is added.
 CREATE TRIGGER trg_family_after_insert
 AFTER INSERT ON families
 FOR EACH ROW
@@ -644,9 +702,10 @@ BEGIN
         ),
         NEW.created_by
     );
-    CALL sp_compute_priority_score(NEW.family_id);
 END$$
 
+-- trg_family_after_update
+-- Logs all family updates and deactivations to audit_log.
 CREATE TRIGGER trg_family_after_update
 AFTER UPDATE ON families
 FOR EACH ROW
@@ -666,26 +725,32 @@ BEGIN
         VALUES (
             'families', OLD.family_id, 'UPDATE',
             JSON_OBJECT(
-                'monthly_income',        OLD.monthly_income,
+                'monthly_income',         OLD.monthly_income,
                 'food_assistance_status', OLD.food_assistance_status,
-                'priority_score',        OLD.priority_score
+                'priority_score',         OLD.priority_score
             ),
             JSON_OBJECT(
-                'monthly_income',        NEW.monthly_income,
+                'monthly_income',         NEW.monthly_income,
                 'food_assistance_status', NEW.food_assistance_status,
-                'priority_score',        NEW.priority_score
+                'priority_score',         NEW.priority_score
             ),
             NEW.updated_by
         );
     END IF;
 END$$
 
+-- trg_member_after_insert
+-- After a member is added: updates vulnerability flags, member_count,
+-- then calls sp_compute_priority_score.
+-- Safe to UPDATE families here because this trigger fires on
+-- family_members, not families — no circular reference.
 CREATE TRIGGER trg_member_after_insert
 AFTER INSERT ON family_members
 FOR EACH ROW
 BEGIN
     UPDATE families SET
-        member_count      = (SELECT COUNT(*) FROM family_members WHERE family_id = NEW.family_id),
+        member_count      = (SELECT COUNT(*) FROM family_members
+                             WHERE family_id = NEW.family_id),
         has_child_under_5 = (SELECT COUNT(*) > 0 FROM family_members
                              WHERE family_id = NEW.family_id
                                AND date_of_birth IS NOT NULL
@@ -702,6 +767,9 @@ BEGIN
     CALL sp_compute_priority_score(NEW.family_id);
 END$$
 
+-- trg_member_after_update
+-- Recomputes priority score when nutritional status, PWD flag,
+-- or date_of_birth changes on any member.
 CREATE TRIGGER trg_member_after_update
 AFTER UPDATE ON family_members
 FOR EACH ROW
@@ -709,7 +777,7 @@ BEGIN
     IF OLD.nutritional_status <> NEW.nutritional_status
        OR OLD.is_pwd <> NEW.is_pwd
        OR (OLD.date_of_birth <> NEW.date_of_birth
-           OR (OLD.date_of_birth IS NULL AND NEW.date_of_birth IS NOT NULL)
+           OR (OLD.date_of_birth IS NULL     AND NEW.date_of_birth IS NOT NULL)
            OR (OLD.date_of_birth IS NOT NULL AND NEW.date_of_birth IS NULL))
     THEN
         UPDATE families SET
@@ -730,6 +798,10 @@ BEGIN
     END IF;
 END$$
 
+-- trg_check_low_stock
+-- After every OUT or EXPIRED inventory transaction, checks if
+-- stock fell below threshold and creates an unresolved alert.
+-- Only one open alert per food item is created at a time.
 CREATE TRIGGER trg_check_low_stock
 AFTER INSERT ON inventory_transactions
 FOR EACH ROW
@@ -738,7 +810,7 @@ BEGIN
     DECLARE v_threshold     INT;
     DECLARE v_open_alert    INT;
 
-    IF NEW.transaction_type IN ('OUT', 'EXPIRED') THEN
+    IF NEW.transaction_type IN ('OUT','EXPIRED') THEN
         SET v_current_stock = fn_get_current_stock(NEW.food_id);
 
         SELECT low_stock_threshold INTO v_threshold
@@ -757,6 +829,9 @@ BEGIN
     END IF;
 END$$
 
+-- trg_donation_item_after_insert
+-- Auto-creates inventory IN transaction whenever a donation item
+-- is recorded. Keeps donations and inventory always in sync.
 CREATE TRIGGER trg_donation_item_after_insert
 AFTER INSERT ON donation_items
 FOR EACH ROW
@@ -779,19 +854,23 @@ DELIMITER ;
 
 -- ============================================================
 -- ADDITIONAL INDEXES
+-- B-tree indexes for the most common query patterns.
 -- ============================================================
 
+-- "Show all active families in barangay X ordered by priority"
 CREATE INDEX idx_families_barangay_priority
     ON families (barangay_id, is_active, priority_score DESC);
 
+-- "Show distribution history for a family by date"
 CREATE INDEX idx_dist_family_date
     ON distributions (family_id, distribution_date DESC);
 
+-- "Find items expiring within 30 days"
 CREATE INDEX idx_expiry_alert
     ON donation_items (expiry_date);
 
 -- ============================================================
--- END OF SCHEMA v2
+-- END OF SCHEMA v3
 -- ============================================================
 
 SET FOREIGN_KEY_CHECKS = 1;
