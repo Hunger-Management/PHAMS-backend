@@ -106,6 +106,27 @@ const getFamilyById = async (req, res) => {
 	}
 };
 
+const BARANGAY_CODES = {
+	1: 'AGU', 2: 'MAG', 3: 'MAR', 4: 'POB', 5: 'SPD',
+	6: 'SRQ', 7: 'STA', 8: 'SRK', 9: 'SRS', 10: 'TAB'
+}
+
+const generateHouseholdId = async (conn, barangayId) => {
+	const code = BARANGAY_CODES[barangayId] || 'UNK'
+	const year = new Date().getFullYear()
+	const prefix = `${code}-${year}-`
+
+	// counts existing households in this barangay this year to get next sequence
+	const [rows] = await conn.query(
+		`SELECT COUNT(*) AS count FROM families
+     WHERE barangay_id = ? AND household_id LIKE ?`,
+		[barangayId, `${prefix}%`]
+	)
+
+	const sequence = (rows[0].count + 1).toString().padStart(4, '0')
+	return `${prefix}${sequence}`
+}
+
 // POST /api/families
 // Register a new family with members
 // Includes deduplication check
@@ -127,6 +148,19 @@ const createFamily = async (req, res) => {
 		return res.status(400).json({
 			message: "family_name, barangay_id, and at least one member are required.",
 		});
+	}
+
+	// Validate: exactly one member must be Head
+	const headCount = members.filter(m => m.relationship === 'Head').length
+	if (headCount === 0) {
+		return res.status(400).json({
+			message: 'At least one family member must be designated as Head of Family.'
+		})
+	}
+	if (headCount > 1) {
+		return res.status(400).json({
+			message: 'Only one family member can be designated as Head of Family.'
+		})
 	}
 
 	// Staff can only register families in their own barangay
@@ -158,14 +192,18 @@ const createFamily = async (req, res) => {
 			});
 		}
 
+		// Generate household ID
+		const householdId = await generateHouseholdId(conn, barangay_id)
+
 		// Insert family
 		const [familyResult] = await conn.query(
 			`INSERT INTO families (
-        barangay_id, family_name, address, is_npa,
-        head_of_family, contact_number, monthly_income,
-        food_assistance_status, member_count, created_by
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    household_id, barangay_id, family_name, address, is_npa,
+    head_of_family, contact_number, monthly_income,
+    food_assistance_status, member_count, created_by
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			[
+				householdId,
 				barangay_id,
 				family_name,
 				address || null,
@@ -173,11 +211,11 @@ const createFamily = async (req, res) => {
 				head_of_family || null,
 				contact_number || null,
 				monthly_income || null,
-				food_assistance_status || "None",
+				food_assistance_status || 'None',
 				members.length,
 				req.user.user_id,
 			]
-		);
+		)
 
 		const newFamilyId = familyResult.insertId;
 
@@ -192,20 +230,23 @@ const createFamily = async (req, res) => {
 
 			await conn.query(
 				`INSERT INTO family_members (
-          family_id, first_name, last_name, date_of_birth,
-          gender, relationship, is_pwd, nutritional_status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    family_id, first_name, last_name, date_of_birth,
+    gender, relationship, is_pwd, nutritional_status,
+    height_cm, weight_kg
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 				[
 					newFamilyId,
 					member.first_name,
 					member.last_name,
 					member.date_of_birth || null,
 					member.gender,
-					member.relationship || "Other",
+					member.relationship || 'Other',
 					member.is_pwd ? 1 : 0,
-					member.nutritional_status || "Unknown",
+					member.nutritional_status || 'Unknown',
+					member.height_cm || null,
+					member.weight_kg || null,
 				]
-			);
+			)
 		}
 
 		await conn.commit();
@@ -214,9 +255,10 @@ const createFamily = async (req, res) => {
 		// trg_family_after_insert trigger in the database
 
 		return res.status(201).json({
-			message: "Family registered successfully.",
+			message: 'Family registered successfully.',
 			family_id: newFamilyId,
-		});
+			household_id: householdId,
+		})
 	} catch (err) {
 		await conn.rollback();
 		console.error("createFamily error:", err);

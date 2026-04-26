@@ -80,6 +80,7 @@ CREATE TABLE users (
 -- ============================================================
 CREATE TABLE families (
     family_id               INT             NOT NULL AUTO_INCREMENT,
+    household_id            VARCHAR(20)     NULL UNIQUE,
     barangay_id             INT             NOT NULL,
     family_name             VARCHAR(150)    NOT NULL,
     address                 VARCHAR(255)    NULL,
@@ -102,16 +103,21 @@ CREATE TABLE families (
     updated_at              DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     created_by              INT             NOT NULL,
     updated_by              INT             NULL,
+
     PRIMARY KEY (family_id),
+
     INDEX idx_families_barangay (barangay_id),
     INDEX idx_families_priority (priority_score DESC),
     INDEX idx_families_active (is_active),
+
     CONSTRAINT fk_families_barangay
         FOREIGN KEY (barangay_id) REFERENCES barangays (barangay_id)
         ON UPDATE CASCADE ON DELETE RESTRICT,
+
     CONSTRAINT fk_families_created_by
         FOREIGN KEY (created_by) REFERENCES users (user_id)
         ON UPDATE CASCADE ON DELETE RESTRICT,
+
     CONSTRAINT fk_families_deactivated_by
         FOREIGN KEY (deactivated_by) REFERENCES users (user_id)
         ON UPDATE CASCADE ON DELETE RESTRICT
@@ -129,6 +135,8 @@ CREATE TABLE family_members (
     first_name          VARCHAR(100)    NOT NULL,
     last_name           VARCHAR(100)    NOT NULL,
     date_of_birth       DATE            NULL,
+    height_cm DECIMAL(5,1) NULL,
+	weight_kg DECIMAL(5,2) NULL,
     gender              ENUM('Male','Female','Other') NOT NULL,
     relationship        ENUM('Head','Spouse','Child','Parent','Sibling','Relative','Other')
                                         NOT NULL DEFAULT 'Other',
